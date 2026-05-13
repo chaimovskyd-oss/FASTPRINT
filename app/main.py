@@ -25,11 +25,11 @@ try:
 except Exception:
     Image = None
 
-SUPPORTED = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
+SUPPORTED = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp', '.gif'}
 if Image is not None:
-    SUPPORTED |= {'.heic', '.avif', '.jp2', '.jxl'}
+    SUPPORTED |= {'.heic', '.avif', '.jp2', '.jxl', '.psd', '.tga'}
 
-APP_TITLE = 'הדפס תמונות חכם - חדיש v1.6'
+APP_TITLE = 'הדפס תמונות חכם - חדיש v1.7'
 ORG_NAME = 'Hadish'
 APP_NAME = 'SmartPhotoPrint'
 INSTANCE_LOCK = 'hadish_smart_photo_print_v16.lock'
@@ -47,6 +47,9 @@ def _pil_to_qimage(pil_image):
 def _load_image_file(path):
     reader = QImageReader(path)
     reader.setAutoTransform(True)
+    # For animated formats take only the first frame
+    if reader.supportsAnimation():
+        reader.jumpToImage(0)
     img = reader.read()
     if not img.isNull():
         return img
@@ -54,7 +57,13 @@ def _load_image_file(path):
         return QImage()
     try:
         with Image.open(path) as pil:
-            return _pil_to_qimage(pil)
+            # Composite frames (GIF/APNG/WEBP animated) onto white background
+            if hasattr(pil, 'n_frames') and pil.n_frames > 1:
+                pil.seek(0)
+            pil = pil.convert('RGBA')
+            bg = Image.new('RGBA', pil.size, (255, 255, 255, 255))
+            bg.paste(pil, mask=pil.split()[3])
+            return _pil_to_qimage(bg.convert('RGBA'))
     except Exception:
         return QImage()
 
@@ -544,15 +553,31 @@ class MainWindow(QMainWindow):
         if not self.items:
             QMessageBox.warning(self,'אין תמונות','לא נבחרו תמונות להדפסה'); return
         self.apply_printer_layout()
-        # Use full page coordinates so the temporary page is drawn to the same
-        # paper canvas shown in preview, not a smaller printable-rect canvas.
-        painter=QPainter(self.printer); painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        first=True
+        total = sum(it.copies for it in self.items)
+        painter = QPainter(self.printer)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        first = True
+        page_num = 0
+        failed = []
         for it in self.items:
             for _ in range(it.copies):
-                if not first: self.printer.newPage()
-                first=False; self.paint_photo(painter, self.printer, it)
-        painter.end(); QMessageBox.information(self,'נשלח להדפסה','העבודה נשלחה למדפסת')
+                if not first:
+                    self.printer.newPage()
+                first = False
+                page_num += 1
+                if total > 1:
+                    self.status.setText(f'מדפיס {page_num} מתוך {total}...')
+                    QApplication.processEvents()
+                try:
+                    self.paint_photo(painter, self.printer, it)
+                except Exception:
+                    failed.append(Path(it.path).name)
+        painter.end()
+        self.status.setText('רווח: Fit/Fill  |  חיצים: מעבר תמונות  |  WASD / שודג בעברית / גרירה: הזזה ב-Fill')
+        msg = f'{total} דפים נשלחו למדפסת'
+        if failed:
+            msg += f'\n\nכשלו: {", ".join(failed)}'
+        QMessageBox.information(self, 'נשלח להדפסה', msg)
 
     def _auto_oriented_image(self, img, tw, th):
         paper_landscape = tw >= th
@@ -586,20 +611,37 @@ class MainWindow(QMainWindow):
         if img.isNull():
             return
 
-        # v1.4: build a full temporary print page in memory and send THAT to the driver.
-        # This avoids a driver/Qt issue where the preview pan was correct, but the
-        # printed Fill crop ignored pan_x/pan_y. The original photo file is never
-        # edited or recompressed; the temporary page exists only in RAM.
+        # dest rect on the printer canvas (device pixels, full paper including bleed)
         try:
             rect = QRectF(printer.paperRect(QPrinter.DevicePixel))
         except Exception:
             rect = QRectF(printer.pageRect(QPrinter.DevicePixel))
-        tw, th = int(round(rect.width())), int(round(rect.height()))
-        if tw <= 0 or th <= 0:
+        if rect.width() <= 0 or rect.height() <= 0:
             return
 
-        # Safety cap for very high-DPI drivers. Photo printers are normally 300/600 DPI;
-        # this keeps quality high without risking a giant in-memory canvas.
+        # Derive the canvas dimensions from the paper combo (mm) + printer DPI so that
+        # the crop/pan calculation uses the exact same aspect ratio as the preview.
+        # Relying on paperRect() aspect ratio alone can fail for photo dye-sub drivers
+        # (e.g. Mitsubishi D80) that report a slightly different bleed canvas, and for
+        # deprecated setOrientation() calls that may not update paperRect() in Qt6.
+        w_mm, h_mm = self.get_selected_paper_dimensions()
+        orientation = self.orientation_combo.currentText()
+        if orientation == 'Landscape':
+            w_mm, h_mm = max(w_mm, h_mm), min(w_mm, h_mm)
+        else:
+            w_mm, h_mm = min(w_mm, h_mm), max(w_mm, h_mm)
+
+        if w_mm > 0 and h_mm > 0:
+            dpi = printer.resolution()
+            if dpi <= 0:
+                dpi = 300
+            tw = max(1, int(round(w_mm / 25.4 * dpi)))
+            th = max(1, int(round(h_mm / 25.4 * dpi)))
+        else:
+            tw = int(round(rect.width()))
+            th = int(round(rect.height()))
+
+        # Safety cap: photo printers are normally 300-600 DPI.
         max_dim = 9000
         scale = min(1.0, max_dim / max(tw, th))
         page_w = max(1, int(round(tw * scale)))
@@ -629,8 +671,6 @@ class MainWindow(QMainWindow):
             pp.drawImage(target, img, QRectF(0, 0, iw, ih))
         else:
             src = self._fill_source_rect(iw, ih, page_w, page_h, it)
-            # Draw using source rect onto the temporary page. Because the source rect is
-            # already baked into the page image, the printer driver cannot recenter it.
             pp.drawImage(target_full, img, src)
         pp.end()
 
